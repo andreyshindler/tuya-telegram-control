@@ -1,5 +1,5 @@
-# Python dependencies
+# Tuya Cloud API client — used by scripts/tuya_manager.py
 tuya-connector-python>=0.1.0
 
-# Optional dependencies
-# python-dotenv>=1.0.0  # If using .env file for configuration management
+# Telegram front-end — used by scripts/telegram_bot.py
+python-telegram-bot>=21.0,<22.0

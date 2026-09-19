@@ -1,9 +1,24 @@
 services:
+  # Idle container for running CLI commands by hand:
+  #   docker exec -it tuya-control python scripts/tuya-cli.py list
+  # No ports needed — it only makes outbound calls to Tuya.
   tuya-control:
     build: .
     container_name: tuya-control
     restart: unless-stopped
     env_file:
       - config.env
-    # No exposed ports needed — this is a CLI/manager container.
-    # Interact with it via: docker exec -it tuya-control python scripts/tuya-cli.py <command>
+    environment:
+      PYTHONUNBUFFERED: "1"
+
+  # The Telegram bot. Long-poll only, so no inbound ports and nothing to put
+  # behind nginx. Logs: docker compose logs -f tuya-bot
+  tuya-bot:
+    build: .
+    container_name: tuya-bot
+    restart: unless-stopped
+    env_file:
+      - config.env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    command: ["python", "scripts/telegram_bot.py"]
