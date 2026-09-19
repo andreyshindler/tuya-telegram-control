@@ -36,6 +36,7 @@ from telegram.ext import (
 
 from intent import IntentParser
 from speech import Transcriber
+from tts import Speaker
 from tuya_manager import TuyaDeviceManager, load_config_from_env_file
 
 logging.basicConfig(
@@ -111,10 +112,12 @@ class TuyaBot:
 
     def __init__(self, allowed_users: set,
                  transcriber: Optional[Transcriber] = None,
-                 intent: Optional[IntentParser] = None):
+                 intent: Optional[IntentParser] = None,
+                 speaker: Optional[Speaker] = None):
         self.allowed_users = allowed_users
         self.transcriber = transcriber
         self.intent = intent
+        self.speaker = speaker
         self._manager: Optional[TuyaDeviceManager] = None
         self._devices: List[Dict[str, Any]] = []
         self._devices_at: float = 0.0
@@ -530,60 +533,114 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- natural language, in Hebrew ------------------------------------------
 
-async def _run_intent(bot: TuyaBot, text: str) -> str:
-    """Map an utterance to an action, perform it, and describe it in Hebrew."""
+async def _spoken_status(bot: TuyaBot, device: Dict[str, Any]) -> Optional[str]:
+    """A one-line spoken answer to "is it on?", or None if it can't be said."""
+    name = device.get("name", "")
+    try:
+        status = await bot.status(device.get("id"))
+        code = await bot.switch_code(device.get("id"))
+    except Exception:
+        logger.exception("status lookup failed while building spoken reply")
+        return None
+    if not status:
+        return f"{name} לא מדווח מצב. יתכן שהוא לא מחובר."
+    value = next((s.get("value") for s in status if s.get("code") == code), None)
+    if isinstance(value, bool):
+        return f"{name} {'דולק' if value else 'כבוי'}."
+    return None
+
+
+async def _speak(bot: TuyaBot, message, text: str, asked_by_voice: bool) -> None:
+    """
+    Send a spoken version of a reply, when configured to.
+
+    Failure here is never allowed to lose the reply — the text has already been
+    sent, so a broken TTS call is logged and otherwise ignored.
+    """
+    if bot.speaker is None or not bot.speaker.wants_voice(asked_by_voice):
+        return
+    try:
+        audio, is_opus = await bot.speaker.synthesize(text)
+    except Exception:
+        logger.exception("speech synthesis failed; reply was sent as text only")
+        return
+    try:
+        if is_opus:
+            await message.reply_voice(audio)
+        else:
+            # Not an OGG/Opus file, so Telegram would reject it as a voice note.
+            await message.reply_audio(audio, title="tuya")
+    except Exception:
+        logger.exception("sending synthesised audio failed")
+
+
+async def _run_intent(bot: TuyaBot, text: str) -> Tuple[str, Optional[str]]:
+    """
+    Map an utterance to an action, perform it, and describe it in Hebrew.
+
+    Returns (html_reply, speakable) — the second is None for replies that are
+    lists or tables, which are worth reading but not hearing.
+    """
     try:
         devices = await bot.devices()
     except Exception as exc:
         logger.exception("device list failed before intent parse")
-        return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}"
+        return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}", None
 
     if not devices:
-        return "לא נמצאו מכשירים בחשבון."
+        return "לא נמצאו מכשירים בחשבון.", "לא נמצאו מכשירים בחשבון."
 
     try:
         result = await bot.intent.parse(text, devices)
     except Exception as exc:
         logger.exception("intent parse failed")
-        return f"⚠️ לא הצלחתי להבין את הבקשה: {esc(exc)}"
+        return f"⚠️ לא הצלחתי להבין את הבקשה: {esc(exc)}", None
 
     action = result["action"]
     reply = esc(result["reply_he"])
     device = next((d for d in devices if d.get("id") == result["device_id"]), None)
 
     if action == "unclear":
-        return f"🤔 {reply}"
+        return f"🤔 {reply}", reply
 
     if action == "list":
-        return format_device_list(devices)
+        # A list is for reading, not hearing.
+        return format_device_list(devices), None
 
     if device is None:
-        return "🤔 לא זיהיתי את המכשיר. נסה שוב בבקשה."
+        msg = "לא זיהיתי את המכשיר. נסה שוב בבקשה."
+        return f"🤔 {msg}", msg
 
     if action == "status":
-        return await _status_text(bot, device)
+        return await _status_text(bot, device), await _spoken_status(bot, device)
 
     if action in ("on", "off"):
         outcome = await _apply_switch(bot, device, action == "on")
-        return f"{reply}\n{outcome}"
+        # Speak the outcome, not the intention: "מכבה" before a failed command
+        # would be a lie.
+        return f"{reply}\n{outcome}", outcome
 
     if action == "brightness":
         percent = result["value"]
         if not isinstance(percent, int) or not 1 <= percent <= 100:
-            return "🤔 לא הבנתי לאיזו עוצמה. אפשר להגיד למשל ‏\"תעמעם ל-30 אחוז\"."
+            msg = "לא הבנתי לאיזו עוצמה. אפשר להגיד למשל תעמעם ל-30 אחוז."
+            return f"🤔 {msg}", msg
         name = esc(device.get("name", ""))
         try:
             ok, detail = await bot.set_brightness(device.get("id"), percent)
         except Exception as exc:
             logger.exception("brightness failed")
-            return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}"
+            return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}", None
         if detail == "unsupported":
-            return f"❌ ל<b>{name}</b> אין שליטה על עוצמת אור."
+            out = f"ל{device.get('name', '')} אין שליטה על עוצמת אור."
+            return f"❌ ל<b>{name}</b> אין שליטה על עוצמת אור.", out
         if ok:
-            return f"{reply}\n✅ <b>{name}</b> — העוצמה עודכנה ל-{percent}%."
-        return f"❌ <b>{name}</b> לא קיבל את הפקודה."
+            out = f"העוצמה של {device.get('name', '')} עודכנה ל-{percent} אחוז."
+            return f"{reply}\n✅ <b>{name}</b> — העוצמה עודכנה ל-{percent}%.", out
+        out = f"{device.get('name', '')} לא קיבל את הפקודה."
+        return f"❌ <b>{name}</b> לא קיבל את הפקודה.", out
 
-    return "🤔 לא הבנתי מה לעשות."
+    return "🤔 לא הבנתי מה לעשות.", "לא הבנתי מה לעשות."
 
 
 @guard
@@ -599,7 +656,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await message.chat.send_action(ChatAction.TYPING)
-    await message.reply_text(await _run_intent(bot, message.text), parse_mode=ParseMode.HTML)
+    reply, spoken = await _run_intent(bot, message.text)
+    await message.reply_text(reply, parse_mode=ParseMode.HTML)
+    if spoken:
+        await _speak(bot, message, spoken, asked_by_voice=False)
 
 
 @guard
@@ -638,10 +698,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Transcribed %ss of audio: %r", getattr(voice, "duration", "?"), transcript)
     # Always echo the transcript: when it mishears a device name, seeing the
     # wrong word is the difference between "it's broken" and "say it again".
-    outcome = await _run_intent(bot, transcript)
+    outcome, spoken = await _run_intent(bot, transcript)
     await message.reply_text(
         f"🎙 <i>{esc(transcript)}</i>\n\n{outcome}", parse_mode=ParseMode.HTML
     )
+    if spoken:
+        await _speak(bot, message, spoken, asked_by_voice=True)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -669,9 +731,10 @@ def main():
 
     transcriber = Transcriber.from_config(get_config)
     intent = IntentParser.from_config(get_config)
+    speaker = Speaker.from_config(get_config)
 
     app = Application.builder().token(token).build()
-    app.bot_data["tuya"] = TuyaBot(allowed, transcriber, intent)
+    app.bot_data["tuya"] = TuyaBot(allowed, transcriber, intent, speaker)
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))

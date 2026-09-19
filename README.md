@@ -1,11 +1,12 @@
 # tuya-telegram-control
 
-Control Tuya smart devices from the Tuya Cloud API, with the eventual goal of
-driving them from Telegram (either a standalone bot or a tool exposed to the
-existing Jarvis/OpenClaw agent).
+Control Tuya smart devices over Telegram — by slash command, by typing Hebrew,
+or by sending a voice note and getting a spoken Hebrew answer back.
 
-Right now this repo contains the **CLI + manager layer** — the part that talks
-to Tuya. The Telegram layer is not built yet; see [Status](#status).
+Send *"תכבה את האור בסלון"* as a voice message and the light goes off.
+
+See [Status](#status) for what has been exercised against real hardware and
+what has not.
 
 ## Layout
 
@@ -16,8 +17,9 @@ to Tuya. The Telegram layer is not built yet; see [Status](#status).
 | `scripts/telegram_bot.py` | Telegram bot front-end — slash commands, Hebrew text and voice |
 | `scripts/speech.py` | Voice-note transcription via an OpenAI-compatible STT endpoint |
 | `scripts/intent.py` | Hebrew utterance → device command, via Claude structured outputs |
+| `scripts/tts.py` | Hebrew spoken replies via ElevenLabs |
 | `config.env.example` | Template for credentials — copy to `config.env` (gitignored) |
-| `Dockerfile` / `docker-compose.yml` | Long-running idle container you `docker exec` commands into |
+| `Dockerfile` / `docker-compose.yml` | Two services: the bot, and an idle container for CLI commands |
 
 ## Setup
 
@@ -157,8 +159,18 @@ needed; anything that isn't a slash command is treated as a request.
                                                 │
                        live device list ──► Claude ──► {action, device_id, value, reply_he}
                                                 │
-                                          Tuya command + Hebrew confirmation
+                                          Tuya command
+                                                │
+                            Hebrew text ──► ElevenLabs ──► 🔊 spoken reply
 ```
+
+Speak to it and it speaks back; type and it types back (`VOICE_REPLIES=auto`,
+the default). `always` speaks every reply, `never` turns speech off. Lists and
+status tables are never spoken — they are for reading.
+
+The spoken line reports the *outcome*, not the intention: a command Tuya
+rejected is never confirmed aloud. A failed ElevenLabs call is logged and
+dropped, never at the cost of the text reply that was already sent.
 
 Why an LLM rather than string matching: a device the Smart Life app calls
 "Living room light" will never substring-match "האור בסלון". Claude receives the
@@ -187,6 +199,7 @@ money and nobody needs two minutes to say "turn off the light".
 - [x] Docker packaging
 - [x] Telegram bot — standalone, tested against a mocked Tuya API
 - [x] Hebrew voice + free text, tested against mocked Groq and Claude
+- [x] Hebrew spoken replies (ElevenLabs `eleven_v3`, verified on real Hebrew audio)
 - [ ] Verify against real devices (`tuya-cli.py list` returning the actual device list)
 - [ ] Verify the bot end-to-end with a real token and real hardware
 - [ ] Optional: expose the same thing to the Jarvis/OpenClaw agent. The manager
