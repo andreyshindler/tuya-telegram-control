@@ -16,7 +16,7 @@ what has not.
 | `scripts/tuya-cli.py` | `argparse` CLI over the manager, for testing and shell use |
 | `scripts/telegram_bot.py` | Telegram bot front-end — slash commands, Hebrew text and voice |
 | `scripts/speech.py` | Voice-note transcription via an OpenAI-compatible STT endpoint |
-| `scripts/intent.py` | Hebrew utterance → device command, via Claude structured outputs |
+| `scripts/intent.py` | Hebrew utterance → device command, via any OpenAI-compatible LLM |
 | `scripts/tts.py` | Hebrew spoken replies via ElevenLabs |
 | `config.env.example` | Template for credentials — copy to `config.env` (gitignored) |
 | `Dockerfile` / `docker-compose.yml` | Two services: the bot, and an idle container for CLI commands |
@@ -157,7 +157,7 @@ needed; anything that isn't a slash command is treated as a request.
 ```
 🎙 voice note ──► Groq whisper-large-v3 ──► Hebrew transcript
                                                 │
-                       live device list ──► Claude ──► {action, device_id, value, reply_he}
+                        live device list ──► LLM ──► {action, device_id, value, reply_he}
                                                 │
                                           Tuya command
                                                 │
@@ -173,9 +173,20 @@ rejected is never confirmed aloud. A failed ElevenLabs call is logged and
 dropped, never at the cost of the text reply that was already sent.
 
 Why an LLM rather than string matching: a device the Smart Life app calls
-"Living room light" will never substring-match "האור בסלון". Claude receives the
-live device list each time and bridges the two, so devices can be named in
+"Living room light" will never substring-match "האור בסלון". The model receives
+the live device list each time and bridges the two, so devices can be named in
 either language.
+
+The provider is configuration, not code — any OpenAI-compatible
+`/chat/completions` endpoint works. It defaults to NVIDIA's hosted models; set
+`LLM_URL=https://api.groq.com/openai/v1` and `LLM_MODEL=llama-3.3-70b-versatile`
+to use Groq instead, which needs no second key if STT already points there.
+
+Because these endpoints give no schema guarantee, the reply is parsed
+defensively: prose or a code fence around the JSON, a string where a number
+belongs, a missing key, an invented action, or a device id that does not exist
+all degrade to a clarifying question in Hebrew. Nothing gets switched on a
+malformed answer.
 
 Three safeguards, because this switches real things on and off:
 
@@ -183,12 +194,15 @@ Three safeguards, because this switches real things on and off:
   visible, instead of looking like a broken bot.
 - **`device_id` is verified against the live list** before anything is sent. A
   hallucinated id becomes a clarifying question, not a wrong device.
+- **Hebrew quality varies by model.** Hebrew is where the smaller open models
+  are weakest, and picking the wrong device is the failure that matters — worth
+  testing a few real phrasings after changing `LLM_MODEL`.
 - **Ambiguity asks.** Two devices fitting equally well produces a question in
   Hebrew rather than a guess.
 
-Both features are optional and degrade independently: with no
-`ANTHROPIC_API_KEY` the slash commands still work; with no `STT_*` the Hebrew
-text path still works, just not voice.
+Both features are optional and degrade independently: with no LLM key the slash
+commands still work; with no `STT_*` the Hebrew text path still works, just not
+voice.
 
 Voice notes longer than 120 seconds are refused — transcription costs real
 money and nobody needs two minutes to say "turn off the light".
@@ -198,9 +212,11 @@ money and nobody needs two minutes to say "turn off the light".
 - [x] Tuya manager + CLI
 - [x] Docker packaging
 - [x] Telegram bot — standalone, tested against a mocked Tuya API
-- [x] Hebrew voice + free text, tested against mocked Groq and Claude
+- [x] Hebrew voice + free text (provider-neutral LLM; NVIDIA by default)
 - [x] Hebrew spoken replies (ElevenLabs `eleven_v3`, verified on real Hebrew audio)
-- [ ] Verify against real devices (`tuya-cli.py list` returning the actual device list)
+- [x] Tuya and Groq transcription confirmed working from the VPS against real
+      devices and real Hebrew speech
+- [ ] Verify the chosen `LLM_MODEL` understands real Hebrew phrasings well enough
 - [ ] Verify the bot end-to-end with a real token and real hardware
 - [ ] Optional: expose the same thing to the Jarvis/OpenClaw agent. The manager
       is importable (`from tuya_manager import TuyaDeviceManager` with `scripts/`
