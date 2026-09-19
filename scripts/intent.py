@@ -4,75 +4,61 @@
 Turn free-text Hebrew (or mixed Hebrew/English) into a device command.
 
 Plain string matching cannot cross languages: a device the Smart Life app calls
-"Living room light" will never substring-match "האור בסלון". Claude gets the
-live device list and does the bridging, returning a fixed JSON shape via
-structured outputs rather than prose we would have to parse.
+"Living room light" will never substring-match "האור בסלון". An LLM gets the
+live device list and does the bridging, returning a fixed JSON shape.
+
+Any OpenAI-compatible /chat/completions endpoint works, so the provider is a
+config change rather than a code change. Defaults to NVIDIA's hosted models.
 
 Configuration:
-    ANTHROPIC_API_KEY   required
-    INTENT_MODEL        default claude-opus-5
+    LLM_URL     endpoint base, default https://integrate.api.nvidia.com/v1
+    LLM_KEY     bearer token; falls back to NVIDIA_API_KEY, then GROQ_API_KEY,
+                then STT_KEY (Groq serves both speech and chat on one key)
+    LLM_MODEL   default meta/llama-3.3-70b-instruct
+    LLM_TIMEOUT default 30 seconds
 """
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
-from anthropic import AsyncAnthropic
+import httpx
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_URL = "https://integrate.api.nvidia.com/v1"
+DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
+COMPLETIONS_PATH = "/chat/completions"
 
 ACTIONS = ("on", "off", "status", "list", "brightness", "unclear")
 
-# additionalProperties:false and a fully-required property set are what make
-# the response shape guaranteed — every field is always present, nullable
-# where it may not apply.
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "action": {
-            "type": "string",
-            "enum": list(ACTIONS),
-            "description": "What the speaker wants. 'unclear' when you cannot tell, "
-                           "or when several devices fit equally well.",
-        },
-        "device_id": {
-            "type": ["string", "null"],
-            "description": "The exact id of the single matching device, or null "
-                           "for the 'list' and 'unclear' actions.",
-        },
-        "value": {
-            "type": ["integer", "null"],
-            "description": "Brightness percentage 1-100 for the 'brightness' action, else null.",
-        },
-        "reply_he": {
-            "type": "string",
-            "description": "One short sentence in Hebrew. For 'unclear', the question "
-                           "to ask back. Otherwise a natural confirmation of what is "
-                           "about to happen.",
-        },
-    },
-    "required": ["action", "device_id", "value", "reply_he"],
-    "additionalProperties": False,
-}
+# Models that are not held to a schema sometimes wrap JSON in prose or a code
+# fence. Pulling out the outermost object is more robust than trusting them.
+JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 SYSTEM = """You translate spoken home-automation requests into a single device command.
 
 The user speaks Hebrew, often mixing in English device names. Device names in \
-the Tuya account may be in either language, so match by meaning, not by \
-spelling: "האור בסלון" refers to a device that might be named "Living room \
-light", and "המנורה על השולחן" to one named "Desk lamp".
+the account may be in either language, so match by meaning, not by spelling: \
+"האור בסלון" refers to a device that might be named "Living room light", and \
+"המנורה על השולחן" to one named "Desk lamp".
+
+Reply with ONLY a JSON object, no prose, no code fence, with exactly these keys:
+{"action": one of on|off|status|list|brightness|unclear,
+ "device_id": the exact id from the device list, or null,
+ "value": brightness percentage 1-100 for the brightness action, else null,
+ "reply_he": one short sentence in Hebrew}
 
 Rules:
 - Pick a device only when one device clearly fits. If two or more fit equally \
-well, or you are guessing, use action "unclear" and ask which one in reply_he.
+well, or you are guessing, use "unclear" and ask which one in reply_he.
 - device_id must be copied exactly from the device list. Never invent one.
-- An offline device can still be chosen; the caller reports the failure.
 - "תדליק"/"תפעיל"/"תעלה" mean on; "תכבה"/"תסגור"/"תוריד" mean off.
 - Asking what state something is in ("מה המצב", "האור דולק?") is "status".
-- Asking what devices exist ("מה יש לי", "תראה לי את המכשירים") is "list".
-- A percentage or "תעמעם"/"יותר בהיר" with a light is "brightness" with value 1-100.
+- Asking what devices exist ("מה יש לי", "תראה לי את המכשירים") is "list", \
+with device_id null.
+- A percentage, or "תעמעם"/"יותר בהיר" with a light, is "brightness".
 - Anything unrelated to controlling these devices is "unclear", with reply_he \
 saying briefly that you only control the listed devices.
 - reply_he is always Hebrew, one short sentence, no emoji, no device ids."""
@@ -88,66 +74,131 @@ def _device_lines(devices: List[Dict[str, Any]]) -> str:
 
 
 class IntentParser:
-    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
-        self.client = AsyncAnthropic(api_key=api_key)
+    def __init__(self, url: str, key: str, model: str, timeout: float = 30.0):
+        self.url = url.rstrip("/")
+        if not self.url.endswith(COMPLETIONS_PATH):
+            self.url += COMPLETIONS_PATH
+        self.key = key
         self.model = model
+        self.timeout = timeout
 
     @classmethod
     def from_config(cls, get) -> Optional["IntentParser"]:
         """Build from a config getter, or None when no key is configured."""
-        key = get("ANTHROPIC_API_KEY")
+        key = (
+            get("LLM_KEY")
+            or get("NVIDIA_API_KEY")
+            or get("GROQ_API_KEY")
+            # Groq serves chat and speech off the same key, so if STT is
+            # configured against Groq the chat side is already paid for.
+            or get("STT_KEY")
+        )
         if not key:
             logger.info(
-                "ANTHROPIC_API_KEY not set — natural language and voice control disabled"
+                "No LLM key (LLM_KEY / NVIDIA_API_KEY) — natural language and "
+                "voice control disabled"
             )
             return None
-        return cls(key, get("INTENT_MODEL") or DEFAULT_MODEL)
+        parser = cls(
+            url=get("LLM_URL") or DEFAULT_URL,
+            key=key,
+            model=get("LLM_MODEL") or DEFAULT_MODEL,
+            timeout=float(get("LLM_TIMEOUT") or 30.0),
+        )
+        logger.info("Intent model: %s at %s", parser.model, parser.url)
+        return parser
 
     async def parse(self, text: str, devices: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Map an utterance onto one device command.
 
-        Returns the validated dict. Raises on API failure — the caller decides
-        what to tell the user.
+        Returns the validated dict. Raises on API or parse failure — the caller
+        decides what to tell the user.
         """
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=SYSTEM,
-            messages=[{
-                "role": "user",
-                "content": (
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": (
                     f"Devices in the account:\n{_device_lines(devices)}\n\n"
                     f"The user said: {text}"
-                ),
-            }],
-            # effort low: this is a short classification, and latency is felt
-            # directly — someone is standing in a room waiting for a light.
-            output_config={
-                "effort": "low",
-                "format": {"type": "json_schema", "schema": SCHEMA},
-            },
-        )
+                )},
+            ],
+            # Low temperature: this is classification, not writing.
+            "temperature": 0,
+            "max_tokens": 400,
+            # Honoured by most OpenAI-compatible servers; harmlessly ignored by
+            # the rest, which is why the response is still parsed defensively.
+            "response_format": {"type": "json_object"},
+        }
 
-        if response.stop_reason == "refusal":
-            raise RuntimeError("intent request was declined by the safety classifier")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                self.url,
+                headers={"Authorization": f"Bearer {self.key}"},
+                json=body,
+            )
 
-        text_block = next((b.text for b in response.content if b.type == "text"), "")
-        result = json.loads(text_block)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"{self.model} returned {response.status_code}: {response.text[:300]}"
+            )
 
-        # Structured outputs guarantee the shape, but not that a device_id is
-        # real — the model could echo a plausible-looking id. Verify against
-        # the list before anything gets switched.
+        content = response.json()["choices"][0]["message"]["content"]
+        return self.validate(content, devices)
+
+    @staticmethod
+    def validate(content: str, devices: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Coerce a model's reply into a usable command, or into a question.
+
+        Without a schema guarantee the reply may be malformed, may omit keys, or
+        may name a device that does not exist. Every one of those becomes a
+        clarifying question rather than an action: guessing would switch the
+        wrong thing in someone's home.
+        """
+        match = JSON_RE.search(content or "")
+        if not match:
+            raise ValueError(f"no JSON in model reply: {content[:200]!r}")
+        result = json.loads(match.group(0))
+
+        if not isinstance(result, dict):
+            raise ValueError(f"model reply was not an object: {content[:200]!r}")
+
+        action = str(result.get("action") or "").strip().lower()
+        if action not in ACTIONS:
+            logger.warning("Model returned unknown action %r", result.get("action"))
+            action = "unclear"
+
+        device_id = result.get("device_id") or None
+        if device_id is not None:
+            device_id = str(device_id)
+
+        value = result.get("value")
+        if not isinstance(value, int):
+            try:
+                value = int(str(value).strip())
+            except (TypeError, ValueError):
+                value = None
+
+        reply = str(result.get("reply_he") or "").strip()
+
         known = {d.get("id") for d in devices}
-        if result["device_id"] is not None and result["device_id"] not in known:
-            logger.warning("Model returned unknown device_id %r", result["device_id"])
-            result["action"] = "unclear"
-            result["device_id"] = None
-            result["reply_he"] = "לא הצלחתי לזהות את המכשיר. איזה מכשיר התכוונת?"
+        if device_id is not None and device_id not in known:
+            logger.warning("Model returned unknown device_id %r", device_id)
+            action, device_id = "unclear", None
+            reply = "לא הצלחתי לזהות את המכשיר. איזה מכשיר התכוונת?"
 
-        if result["action"] in ("on", "off", "status", "brightness") and not result["device_id"]:
-            result["action"] = "unclear"
-            if not result["reply_he"]:
-                result["reply_he"] = "על איזה מכשיר מדובר?"
+        if action in ("on", "off", "status", "brightness") and not device_id:
+            action = "unclear"
+            reply = reply or "על איזה מכשיר מדובר?"
 
-        return result
+        if not reply:
+            reply = "לא הבנתי את הבקשה."
+
+        return {
+            "action": action,
+            "device_id": device_id,
+            "value": value,
+            "reply_he": reply,
+        }
