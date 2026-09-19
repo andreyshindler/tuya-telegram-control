@@ -13,7 +13,9 @@ to Tuya. The Telegram layer is not built yet; see [Status](#status).
 | --- | --- |
 | `scripts/tuya_manager.py` | `TuyaDeviceManager` — the importable API wrapper (devices, status, control, scenes, automations) |
 | `scripts/tuya-cli.py` | `argparse` CLI over the manager, for testing and shell use |
-| `scripts/telegram_bot.py` | Telegram bot front-end (`/list`, `/on`, `/off`, `/status`) |
+| `scripts/telegram_bot.py` | Telegram bot front-end — slash commands, Hebrew text and voice |
+| `scripts/speech.py` | Voice-note transcription via an OpenAI-compatible STT endpoint |
+| `scripts/intent.py` | Hebrew utterance → device command, via Claude structured outputs |
 | `config.env.example` | Template for credentials — copy to `config.env` (gitignored) |
 | `Dockerfile` / `docker-compose.yml` | Long-running idle container you `docker exec` commands into |
 
@@ -145,11 +147,46 @@ The on/off DP code is detected per device from its live status (preferring
 `switch`, `switch_1`, `switch_led`, …) and cached, rather than assuming
 `switch_1` the way `tuya-cli.py on` does.
 
+## Hebrew: voice and free text
+
+Send a voice note — *"תכבה את האור בסלון"* — or type the same thing. No command
+needed; anything that isn't a slash command is treated as a request.
+
+```
+🎙 voice note ──► Groq whisper-large-v3 ──► Hebrew transcript
+                                                │
+                       live device list ──► Claude ──► {action, device_id, value, reply_he}
+                                                │
+                                          Tuya command + Hebrew confirmation
+```
+
+Why an LLM rather than string matching: a device the Smart Life app calls
+"Living room light" will never substring-match "האור בסלון". Claude receives the
+live device list each time and bridges the two, so devices can be named in
+either language.
+
+Three safeguards, because this switches real things on and off:
+
+- **The transcript is always echoed back.** A misheard device name is then
+  visible, instead of looking like a broken bot.
+- **`device_id` is verified against the live list** before anything is sent. A
+  hallucinated id becomes a clarifying question, not a wrong device.
+- **Ambiguity asks.** Two devices fitting equally well produces a question in
+  Hebrew rather than a guess.
+
+Both features are optional and degrade independently: with no
+`ANTHROPIC_API_KEY` the slash commands still work; with no `STT_*` the Hebrew
+text path still works, just not voice.
+
+Voice notes longer than 120 seconds are refused — transcription costs real
+money and nobody needs two minutes to say "turn off the light".
+
 ## Status
 
 - [x] Tuya manager + CLI
 - [x] Docker packaging
 - [x] Telegram bot — standalone, tested against a mocked Tuya API
+- [x] Hebrew voice + free text, tested against mocked Groq and Claude
 - [ ] Verify against real devices (`tuya-cli.py list` returning the actual device list)
 - [ ] Verify the bot end-to-end with a real token and real hardware
 - [ ] Optional: expose the same thing to the Jarvis/OpenClaw agent. The manager

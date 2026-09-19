@@ -24,14 +24,18 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
+from intent import IntentParser
+from speech import Transcriber
 from tuya_manager import TuyaDeviceManager, load_config_from_env_file
 
 logging.basicConfig(
@@ -59,19 +63,27 @@ SWITCH_CODE_PRIORITY = (
     "power",
 )
 
+# Telegram caps voice notes well below this, but a long one still costs real
+# transcription time and money, so refuse rather than grind.
+MAX_VOICE_SECONDS = 120
+
+# Brightness DP codes, most common first.
+BRIGHTNESS_CODES = ("bright_value", "bright_value_v2", "bright_value_1")
+
 # Status codes worth surfacing in /status, and how to label them.
 INTERESTING_CODES = {
-    "bright_value": "brightness",
-    "bright_value_v2": "brightness",
-    "temp_value": "colour temp",
-    "temp_current": "temperature",
-    "temp_set": "target temp",
-    "humidity_value": "humidity",
-    "cur_power": "power",
-    "cur_voltage": "voltage",
-    "cur_current": "current",
-    "battery_percentage": "battery",
-    "work_mode": "mode",
+    "bright_value": "בהירות",
+    "bright_value_v2": "בהירות",
+    "bright_value_1": "בהירות",
+    "temp_value": "גוון אור",
+    "temp_current": "טמפרטורה",
+    "temp_set": "טמפרטורת יעד",
+    "humidity_value": "לחות",
+    "cur_power": "הספק",
+    "cur_voltage": "מתח",
+    "cur_current": "זרם",
+    "battery_percentage": "סוללה",
+    "work_mode": "מצב עבודה",
 }
 
 
@@ -97,8 +109,12 @@ def parse_allowed_users(raw: str) -> set:
 class TuyaBot:
     """Holds the manager, the device cache and the per-device switch codes."""
 
-    def __init__(self, allowed_users: set):
+    def __init__(self, allowed_users: set,
+                 transcriber: Optional[Transcriber] = None,
+                 intent: Optional[IntentParser] = None):
         self.allowed_users = allowed_users
+        self.transcriber = transcriber
+        self.intent = intent
         self._manager: Optional[TuyaDeviceManager] = None
         self._devices: List[Dict[str, Any]] = []
         self._devices_at: float = 0.0
@@ -161,6 +177,22 @@ class TuyaBot:
         ok = await self._call("control_device", device_id, code, on)
         return ok, code
 
+    async def set_brightness(self, device_id: str, percent: int) -> Tuple[bool, str]:
+        """Set brightness, if this device reports a brightness code at all."""
+        status = await self.status(device_id)
+        codes = {s.get("code") for s in status}
+        code = next((c for c in BRIGHTNESS_CODES if c in codes), None)
+        if code is None:
+            return False, "unsupported"
+        # Tuya brightness ranges vary by device (0-255, 10-1000). The reported
+        # value's magnitude is the only hint available without the functions
+        # call, so scale the percentage onto the range it implies.
+        current = next((s.get("value") for s in status if s.get("code") == code), 0)
+        ceiling = 1000 if isinstance(current, int) and current > 255 else 255
+        value = max(1, round(percent / 100 * ceiling))
+        ok = await self._call("control_device", device_id, code, value)
+        return ok, code
+
     # --- name resolution ---------------------------------------------------
 
     async def resolve(self, query: str) -> List[Dict[str, Any]]:
@@ -210,18 +242,18 @@ def device_icon(device: Dict[str, Any]) -> str:
 
 
 def online_marker(device: Dict[str, Any]) -> str:
-    return "" if device.get("online", True) else " <i>(offline)</i>"
+    return "" if device.get("online", True) else " <i>(לא מחובר)</i>"
 
 
 def format_device_list(devices: List[Dict[str, Any]]) -> str:
     if not devices:
         return (
-            "No devices found.\n\n"
-            "If you expected some, check that the app account is still linked "
-            "under Tuya → Cloud → your project → Devices → Link App Account, "
-            "and that this host's IP is on the Cloud Authorization allowlist."
+            "לא נמצאו מכשירים.\n\n"
+            "אם צריכים להיות — בדוק שחשבון האפליקציה עדיין מקושר "
+            "(Tuya → Cloud → הפרויקט → Devices → Link App Account), "
+            "ושה-IP של השרת נמצא ברשימת ההיתר של Tuya."
         )
-    lines = [f"<b>{len(devices)} device(s)</b>", ""]
+    lines = [f"<b>{len(devices)} מכשירים</b>", ""]
     for d in sorted(devices, key=lambda x: x.get("name", "").lower()):
         lines.append(
             f"{device_icon(d)} <b>{esc(d.get('name', 'unnamed'))}</b>"
@@ -237,13 +269,13 @@ def format_status(device: Dict[str, Any], status: List[Dict[str, Any]],
     lines = [f"{device_icon(device)} <b>{name}</b>{online_marker(device)}"]
 
     if not status:
-        lines.append("\nNo status reported. The device may be offline.")
+        lines.append("\nהמכשיר לא מדווח מצב. יתכן שהוא לא מחובר.")
         return "\n".join(lines)
 
     by_code = {s.get("code"): s.get("value") for s in status}
 
     if switch_code and isinstance(by_code.get(switch_code), bool):
-        lines.append(f"\nPower: <b>{'on' if by_code[switch_code] else 'off'}</b>"
+        lines.append(f"\nמצב: <b>{'דולק' if by_code[switch_code] else 'כבוי'}</b>"
                      f"  <code>{esc(switch_code)}</code>")
 
     extras = []
@@ -260,7 +292,7 @@ def format_status(device: Dict[str, Any], status: List[Dict[str, Any]],
         if c != switch_code and c not in INTERESTING_CODES
     ]
     if others:
-        lines.append("\n<i>other codes</i>")
+        lines.append("\n<i>נתונים נוספים</i>")
         lines.extend(others)
 
     return "\n".join(lines)
@@ -318,7 +350,12 @@ HELP = """<b>Tuya control</b>
 /whoami — your Telegram user id
 
 Names are matched loosely, so <code>/on desk</code> finds "Desk lamp".
-If a name matches more than one device you get buttons to pick from."""
+If a name matches more than one device you get buttons to pick from.
+
+<b>בעברית</b> — אפשר גם פשוט לדבר או לכתוב, בלי פקודות:
+🎙 שלח הודעה קולית, למשל "תכבה את האור בסלון"
+⌨️ או כתוב את אותו הדבר כטקסט
+השמות מותאמים לפי משמעות, גם אם המכשירים מוגדרים באנגלית."""
 
 
 @guard
@@ -408,13 +445,13 @@ async def _apply_switch(bot: TuyaBot, device: Dict[str, Any], on: bool) -> str:
         ok, detail = await bot.set_switch(device_id, on)
     except Exception as exc:
         logger.exception("control_device failed")
-        return f"Tuya call failed: {esc(exc)}"
+        return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}"
 
     if ok:
-        return f"✅ <b>{name}</b> switched {'on' if on else 'off'}."
+        return f"✅ <b>{name}</b> {'הודלק' if on else 'כובה'}."
     if device.get("online") is False:
-        return f"❌ <b>{name}</b> did not accept the command — it reports as offline."
-    return f"❌ <b>{name}</b> did not accept the command ({esc(detail)})."
+        return f"❌ <b>{name}</b> לא קיבל את הפקודה — הוא מדווח שהוא לא מחובר."
+    return f"❌ <b>{name}</b> לא קיבל את הפקודה ({esc(detail)})."
 
 
 @guard
@@ -463,7 +500,7 @@ async def _status_text(bot: TuyaBot, device: Dict[str, Any]) -> str:
         code = await bot.switch_code(device.get("id"))
     except Exception as exc:
         logger.exception("status lookup failed")
-        return f"Tuya call failed: {esc(exc)}"
+        return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}"
     return format_status(device, status, code)
 
 
@@ -491,6 +528,122 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode=ParseMode.HTML)
 
 
+# --- natural language, in Hebrew ------------------------------------------
+
+async def _run_intent(bot: TuyaBot, text: str) -> str:
+    """Map an utterance to an action, perform it, and describe it in Hebrew."""
+    try:
+        devices = await bot.devices()
+    except Exception as exc:
+        logger.exception("device list failed before intent parse")
+        return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}"
+
+    if not devices:
+        return "לא נמצאו מכשירים בחשבון."
+
+    try:
+        result = await bot.intent.parse(text, devices)
+    except Exception as exc:
+        logger.exception("intent parse failed")
+        return f"⚠️ לא הצלחתי להבין את הבקשה: {esc(exc)}"
+
+    action = result["action"]
+    reply = esc(result["reply_he"])
+    device = next((d for d in devices if d.get("id") == result["device_id"]), None)
+
+    if action == "unclear":
+        return f"🤔 {reply}"
+
+    if action == "list":
+        return format_device_list(devices)
+
+    if device is None:
+        return "🤔 לא זיהיתי את המכשיר. נסה שוב בבקשה."
+
+    if action == "status":
+        return await _status_text(bot, device)
+
+    if action in ("on", "off"):
+        outcome = await _apply_switch(bot, device, action == "on")
+        return f"{reply}\n{outcome}"
+
+    if action == "brightness":
+        percent = result["value"]
+        if not isinstance(percent, int) or not 1 <= percent <= 100:
+            return "🤔 לא הבנתי לאיזו עוצמה. אפשר להגיד למשל ‏\"תעמעם ל-30 אחוז\"."
+        name = esc(device.get("name", ""))
+        try:
+            ok, detail = await bot.set_brightness(device.get("id"), percent)
+        except Exception as exc:
+            logger.exception("brightness failed")
+            return f"⚠️ שגיאה בפנייה ל-Tuya: {esc(exc)}"
+        if detail == "unsupported":
+            return f"❌ ל<b>{name}</b> אין שליטה על עוצמת אור."
+        if ok:
+            return f"{reply}\n✅ <b>{name}</b> — העוצמה עודכנה ל-{percent}%."
+        return f"❌ <b>{name}</b> לא קיבל את הפקודה."
+
+    return "🤔 לא הבנתי מה לעשות."
+
+
+@guard
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Any non-command message is treated as a spoken-style request."""
+    bot: TuyaBot = context.application.bot_data["tuya"]
+    message = update.effective_message
+    if bot.intent is None:
+        await message.reply_text(
+            "שליטה בשפה חופשית אינה מוגדרת (חסר ANTHROPIC_API_KEY). "
+            "אפשר להשתמש בפקודות: /list, /on, /off, /status"
+        )
+        return
+
+    await message.chat.send_action(ChatAction.TYPING)
+    await message.reply_text(await _run_intent(bot, message.text), parse_mode=ParseMode.HTML)
+
+
+@guard
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Transcribe a voice note, then treat the transcript as a request."""
+    bot: TuyaBot = context.application.bot_data["tuya"]
+    message = update.effective_message
+    voice = message.voice or message.audio
+
+    if bot.transcriber is None:
+        await message.reply_text(
+            "הודעות קוליות אינן מוגדרות (חסר STT_URL/STT_KEY). "
+            "אפשר לכתוב את הבקשה כטקסט."
+        )
+        return
+    if bot.intent is None:
+        await message.reply_text("חסר ANTHROPIC_API_KEY, ולכן אין פענוח של בקשות חופשיות.")
+        return
+    if voice.duration and voice.duration > MAX_VOICE_SECONDS:
+        await message.reply_text(
+            f"ההודעה ארוכה מדי ({voice.duration} שניות). עד {MAX_VOICE_SECONDS} שניות."
+        )
+        return
+
+    await message.chat.send_action(ChatAction.TYPING)
+    try:
+        handle = await voice.get_file()
+        audio = bytes(await handle.download_as_bytearray())
+        transcript = await bot.transcriber.transcribe(audio)
+    except Exception as exc:
+        logger.exception("transcription failed")
+        await message.reply_text(f"⚠️ לא הצלחתי לתמלל את ההודעה: {esc(exc)}",
+                                parse_mode=ParseMode.HTML)
+        return
+
+    logger.info("Transcribed %ss of audio: %r", getattr(voice, "duration", "?"), transcript)
+    # Always echo the transcript: when it mishears a device name, seeing the
+    # wrong word is the difference between "it's broken" and "say it again".
+    outcome = await _run_intent(bot, transcript)
+    await message.reply_text(
+        f"🎙 <i>{esc(transcript)}</i>\n\n{outcome}", parse_mode=ParseMode.HTML
+    )
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error while processing update", exc_info=context.error)
 
@@ -514,8 +667,11 @@ def main():
         )
     logger.info("Authorised Telegram user ids: %s", ", ".join(str(u) for u in sorted(allowed)))
 
+    transcriber = Transcriber.from_config(get_config)
+    intent = IntentParser.from_config(get_config)
+
     app = Application.builder().token(token).build()
-    app.bot_data["tuya"] = TuyaBot(allowed)
+    app.bot_data["tuya"] = TuyaBot(allowed, transcriber, intent)
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
@@ -525,6 +681,10 @@ def main():
     app.add_handler(CommandHandler("off", cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    # Registered last: anything that is not a command and not audio is treated
+    # as a free-text request.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
 
     logger.info("Starting Telegram polling")

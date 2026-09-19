@@ -3,3 +3,6 @@ tuya-connector-python>=0.1.0
 
 # Telegram front-end — used by scripts/telegram_bot.py
 python-telegram-bot>=21.0,<22.0
+
+# Hebrew intent extraction — used by scripts/intent.py
+anthropic>=0.40.0
