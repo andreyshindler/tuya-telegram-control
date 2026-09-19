@@ -1,0 +1,5 @@
+# Python dependencies
+tuya-connector-python>=0.1.0
+
+# Optional dependencies
+# python-dotenv>=1.0.0  # If using .env file for configuration management

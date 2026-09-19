@@ -1,0 +1,8 @@
+# Real credentials live here — never commit
+config.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
