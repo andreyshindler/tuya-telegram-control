@@ -1,0 +1,9 @@
+services:
+  tuya-control:
+    build: .
+    container_name: tuya-control
+    restart: unless-stopped
+    env_file:
+      - config.env
+    # No exposed ports needed — this is a CLI/manager container.
+    # Interact with it via: docker exec -it tuya-control python scripts/tuya-cli.py <command>
