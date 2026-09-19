@@ -13,6 +13,7 @@ to Tuya. The Telegram layer is not built yet; see [Status](#status).
 | --- | --- |
 | `scripts/tuya_manager.py` | `TuyaDeviceManager` — the importable API wrapper (devices, status, control, scenes, automations) |
 | `scripts/tuya-cli.py` | `argparse` CLI over the manager, for testing and shell use |
+| `scripts/telegram_bot.py` | Telegram bot front-end (`/list`, `/on`, `/off`, `/status`) |
 | `config.env.example` | Template for credentials — copy to `config.env` (gitignored) |
 | `Dockerfile` / `docker-compose.yml` | Long-running idle container you `docker exec` commands into |
 
@@ -109,12 +110,48 @@ tuya-cli.py add_automation <home_id> --json-file plan.json
 (`switch`, `switch_led`, …) need `on <id> -s switch_led` or
 `set <id> <code> <value>` — check `device_func <id>` first.
 
+## Telegram bot
+
+```
+/list              every device, with its id
+/status <name>     what a device reports right now
+/on <name>         switch on
+/off <name>        switch off
+/refresh           re-fetch the device list from Tuya
+/whoami            your Telegram user id
+```
+
+Names match loosely — `/on desk` finds "Desk lamp". If a name matches more than
+one device, the bot replies with buttons to pick from.
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather), copy the token into
+   `TELEGRAM_BOT_TOKEN` in `config.env`.
+2. Set `TELEGRAM_ALLOWED_USERS` to a throwaway value (e.g. `0`) and start the
+   bot, send it `/whoami`, then put your real user id there and restart.
+3. `docker compose up -d --build` — the `tuya-bot` service polls Telegram, so
+   there are no inbound ports and nothing to put behind nginx.
+
+Logs: `docker compose logs -f tuya-bot`.
+
+**The bot refuses to start with an empty `TELEGRAM_ALLOWED_USERS`.** A Telegram
+bot token is a bearer credential to a bot anyone can find and message, and this
+one switches things on and off in a home, so it fails closed. `/whoami` is the
+only command that answers unauthorised users, so that someone locked out can
+read their own id.
+
+The on/off DP code is detected per device from its live status (preferring
+`switch`, `switch_1`, `switch_led`, …) and cached, rather than assuming
+`switch_1` the way `tuya-cli.py on` does.
+
 ## Status
 
 - [x] Tuya manager + CLI
 - [x] Docker packaging
+- [x] Telegram bot — standalone, tested against a mocked Tuya API
 - [ ] Verify against real devices (`tuya-cli.py list` returning the actual device list)
-- [ ] Telegram interface — undecided between a standalone bot and a tool for the
-      existing Jarvis/OpenClaw agent. The manager is importable
-      (`from scripts.tuya_manager import TuyaDeviceManager`), so either path
-      reuses it rather than shelling out to the CLI.
+- [ ] Verify the bot end-to-end with a real token and real hardware
+- [ ] Optional: expose the same thing to the Jarvis/OpenClaw agent. The manager
+      is importable (`from tuya_manager import TuyaDeviceManager` with `scripts/`
+      on the path), so that path reuses it rather than shelling out to the CLI.
