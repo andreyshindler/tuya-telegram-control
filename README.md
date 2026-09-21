@@ -225,15 +225,37 @@ money and nobody needs two minutes to say "turn off the light".
 
 ## Status
 
+Working end to end against real hardware: a Hebrew voice note switches a real
+light and gets a spoken Hebrew reply.
+
 - [x] Tuya manager + CLI
 - [x] Docker packaging
-- [x] Telegram bot — standalone, tested against a mocked Tuya API
-- [x] Hebrew voice + free text (provider-neutral LLM; NVIDIA by default)
-- [x] Hebrew spoken replies (ElevenLabs `eleven_v3`, verified on real Hebrew audio)
-- [x] Tuya and Groq transcription confirmed working from the VPS against real
-      devices and real Hebrew speech
-- [ ] Verify the chosen `LLM_MODEL` understands real Hebrew phrasings well enough
-- [ ] Verify the bot end-to-end with a real token and real hardware
-- [ ] Optional: expose the same thing to the Jarvis/OpenClaw agent. The manager
-      is importable (`from tuya_manager import TuyaDeviceManager` with `scripts/`
-      on the path), so that path reuses it rather than shelling out to the CLI.
+- [x] Telegram bot — slash commands
+- [x] Hebrew free text → device command
+- [x] Hebrew voice notes — transcription via Groq `whisper-large-v3`
+- [x] Spoken Hebrew replies via ElevenLabs `eleven_v3`
+- [x] Verified against a real account: 74 devices, correct device picked from a
+      Hebrew phrase, correct DP code, light switched, voice reply delivered
+- [ ] Tune ambiguity handling on similarly-named devices (two "pergola"
+      devices resolved by choice rather than by asking)
+
+### Tuya account limits worth knowing
+
+The free IoT Core tier allows **10 controllable devices**, independent of how
+many are linked — and the pool is shared across every project authorised
+against that subscription, not per project. Reading is effectively unlimited,
+so `/list` and `/status` keep working perfectly while every control command is
+refused with `60001001`. Cloud → Cloud Services → IoT Core shows the counts;
+the Devices page has a *Device Permission* filter that lists which devices hold
+the slots.
+
+### Tested provider combination
+
+| Layer | What was used |
+| --- | --- |
+| Transcription | Groq `whisper-large-v3`, `language=he` |
+| Intent | Groq `openai/gpt-oss-120b`, `reasoning_effort=low` |
+| Speech | ElevenLabs `eleven_v3` |
+
+Groq serves transcription and chat from one key, so `STT_KEY` and `LLM_KEY` can
+be the same value.
