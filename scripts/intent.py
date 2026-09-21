@@ -16,6 +16,11 @@ Configuration:
                 then STT_KEY (Groq serves both speech and chat on one key)
     LLM_MODEL   default meta/llama-3.3-70b-instruct
     LLM_TIMEOUT default 30 seconds
+    LLM_MAX_TOKENS       default 2000 — must cover a reasoning model's hidden
+                         reasoning as well as the JSON, or the server rejects
+                         the truncated document
+    LLM_REASONING_EFFORT low|medium|high, sent only when the model accepts it;
+                         defaults to low for gpt-oss models
 """
 
 import json
@@ -74,13 +79,23 @@ def _device_lines(devices: List[Dict[str, Any]]) -> str:
 
 
 class IntentParser:
-    def __init__(self, url: str, key: str, model: str, timeout: float = 30.0):
+    def __init__(self, url: str, key: str, model: str, timeout: float = 30.0,
+                 max_tokens: int = 2000, reasoning_effort: Optional[str] = None):
         self.url = url.rstrip("/")
         if not self.url.endswith(COMPLETIONS_PATH):
             self.url += COMPLETIONS_PATH
         self.key = key
         self.model = model
         self.timeout = timeout
+        self.max_tokens = max_tokens
+        # Reasoning models spend tokens thinking before they answer, and that
+        # spend counts against max_tokens. Left to itself, gpt-oss reasons past
+        # the budget and the server rejects the half-written JSON, so ask for
+        # the shallowest reasoning. Only sent to models known to accept it —
+        # other providers reject unknown fields.
+        if reasoning_effort is None and "gpt-oss" in model:
+            reasoning_effort = "low"
+        self.reasoning_effort = reasoning_effort
 
     @classmethod
     def from_config(cls, get) -> Optional["IntentParser"]:
@@ -104,8 +119,14 @@ class IntentParser:
             key=key,
             model=get("LLM_MODEL") or DEFAULT_MODEL,
             timeout=float(get("LLM_TIMEOUT") or 30.0),
+            max_tokens=int(get("LLM_MAX_TOKENS") or 2000),
+            reasoning_effort=get("LLM_REASONING_EFFORT") or None,
         )
-        logger.info("Intent model: %s at %s", parser.model, parser.url)
+        logger.info(
+            "Intent model: %s at %s (max_tokens=%d%s)",
+            parser.model, parser.url, parser.max_tokens,
+            f", reasoning_effort={parser.reasoning_effort}" if parser.reasoning_effort else "",
+        )
         return parser
 
     async def parse(self, text: str, devices: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -126,11 +147,13 @@ class IntentParser:
             ],
             # Low temperature: this is classification, not writing.
             "temperature": 0,
-            "max_tokens": 400,
+            "max_tokens": self.max_tokens,
             # Honoured by most OpenAI-compatible servers; harmlessly ignored by
             # the rest, which is why the response is still parsed defensively.
             "response_format": {"type": "json_object"},
         }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
