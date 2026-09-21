@@ -172,6 +172,13 @@ class TuyaBot:
             self._switch_codes[device_id] = code
         return code
 
+    def last_error(self) -> Optional[str]:
+        """Tuya's own explanation of the last failed command, if any."""
+        return getattr(self._manager, "last_error", None)
+
+    def last_error_code(self) -> Optional[int]:
+        return getattr(self._manager, "last_error_code", None)
+
     async def set_switch(self, device_id: str, on: bool) -> Tuple[bool, str]:
         """Switch a device on or off. Returns (ok, detail-for-the-user)."""
         code = await self.switch_code(device_id)
@@ -454,7 +461,7 @@ async def _apply_switch(bot: TuyaBot, device: Dict[str, Any], on: bool) -> str:
         return f"✅ <b>{name}</b> {'הודלק' if on else 'כובה'}."
     if device.get("online") is False:
         return f"❌ <b>{name}</b> לא קיבל את הפקודה — הוא מדווח שהוא לא מחובר."
-    return f"❌ <b>{name}</b> לא קיבל את הפקודה ({esc(detail)})."
+    return f"❌ <b>{name}</b> לא קיבל את הפקודה.\n{tuya_reason(bot, detail)}"
 
 
 @guard
@@ -532,6 +539,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- natural language, in Hebrew ------------------------------------------
+
+# Tuya error codes worth explaining rather than quoting. The quota one in
+# particular says nothing about what to do next, and its English wording sends
+# people looking for a fault in their own setup.
+TUYA_ERROR_HELP = {
+    60001001: (
+        "מכסת המכשירים הניתנים לשליטה בחשבון Tuya מלאה. "
+        "אפשר להאריך את התקופה החינמית או לצמצם מכשירים מקושרים "
+        "ב-platform.tuya.com תחת Cloud → Cloud Services → IoT Core."
+    ),
+    1106: "אין הרשאה למכשיר הזה בפרויקט ב-Tuya.",
+}
+
+
+def tuya_reason(bot: TuyaBot, fallback: str) -> str:
+    """Explain a failed command in Tuya's own words, translated where useful."""
+    code = bot.last_error_code()
+    if code in TUYA_ERROR_HELP:
+        return f"⚠️ {TUYA_ERROR_HELP[code]}"
+    message = bot.last_error()
+    if message:
+        return f"⚠️ Tuya: {esc(message)}"
+    return f"⚠️ {esc(fallback)}"
+
 
 async def _spoken_status(bot: TuyaBot, device: Dict[str, Any]) -> Optional[str]:
     """A one-line spoken answer to "is it on?", or None if it can't be said."""
@@ -638,7 +669,7 @@ async def _run_intent(bot: TuyaBot, text: str) -> Tuple[str, Optional[str]]:
             out = f"העוצמה של {device.get('name', '')} עודכנה ל-{percent} אחוז."
             return f"{reply}\n✅ <b>{name}</b> — העוצמה עודכנה ל-{percent}%.", out
         out = f"{device.get('name', '')} לא קיבל את הפקודה."
-        return f"❌ <b>{name}</b> לא קיבל את הפקודה.", out
+        return f"❌ <b>{name}</b> לא קיבל את הפקודה.\n{tuya_reason(bot, detail)}", out
 
     return "🤔 לא הבנתי מה לעשות.", "לא הבנתי מה לעשות."
 
