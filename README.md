@@ -179,8 +179,18 @@ either language.
 
 The provider is configuration, not code — any OpenAI-compatible
 `/chat/completions` endpoint works. It defaults to NVIDIA's hosted models; set
-`LLM_URL=https://api.groq.com/openai/v1` and `LLM_MODEL=llama-3.3-70b-versatile`
-to use Groq instead, which needs no second key if STT already points there.
+`LLM_URL=https://api.groq.com/openai/v1` and `LLM_MODEL=openai/gpt-oss-120b` to
+use Groq instead, which needs no second key if STT already points there.
+Providers retire model names often, so a stale one shows up as a plain 404 —
+`curl $LLM_URL/models -H "Authorization: Bearer $LLM_KEY"` lists what yours can
+actually reach.
+
+Reasoning models (gpt-oss and friends) spend tokens thinking before they
+answer, and that spend counts against `max_tokens` — set it too low and the
+server rejects the half-written JSON with a `json_validate_failed` 400. The
+budget defaults to 2000 and gpt-oss models are asked for `reasoning_effort:
+low` automatically; both are overridable, and the field is sent only to models
+known to accept it.
 
 Because these endpoints give no schema guarantee, the reply is parsed
 defensively: prose or a code fence around the JSON, a string where a number
