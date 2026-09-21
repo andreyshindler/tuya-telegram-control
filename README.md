@@ -198,6 +198,12 @@ belongs, a missing key, an invented action, or a device id that does not exist
 all degrade to a clarifying question in Hebrew. Nothing gets switched on a
 malformed answer.
 
+When Tuya refuses a command, its own reason reaches Telegram rather than a
+guess at the cause. The quota error in particular (`60001001`, "controllable
+device pool quota is insufficient") is explained in Hebrew with where to fix
+it — reading from devices is unlimited on the free tier, but controlling them
+is not, so a large account hits this while `/list` and `/status` keep working.
+
 Three safeguards, because this switches real things on and off:
 
 - **The transcript is always echoed back.** A misheard device name is then

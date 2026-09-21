@@ -133,6 +133,11 @@ class TuyaDeviceManager:
                 "UID has higher priority, recommend setting TUYA_UID"
             )
 
+        # Why the last control call failed, for callers that want to show the
+        # user Tuya's own words rather than guessing at a cause.
+        self.last_error: Optional[str] = None
+        self.last_error_code: Optional[int] = None
+
         self.openapi = TuyaOpenAPI(
             self.endpoint,
             self.access_id,
@@ -601,12 +606,18 @@ class TuyaDeviceManager:
 
             if response.get('success'):
                 logger.info(f"✅ Device {device_id} control successful: {dp_code}={dp_value}")
+                self.last_error = None
+                self.last_error_code = None
                 return True
             else:
                 logger.error(f"❌ Device control failed: {response.get('msg')} {response}")
+                self.last_error = response.get('msg') or 'Unknown error'
+                self.last_error_code = response.get('code')
                 return False
         except Exception as e:
             logger.error(f"Exception controlling device: {str(e)}")
+            self.last_error = str(e)
+            self.last_error_code = None
             return False
 
     def turn_on(self, device_id: str, switch_code: str = "switch_1") -> bool:
